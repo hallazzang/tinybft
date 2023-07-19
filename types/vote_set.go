@@ -19,6 +19,24 @@ type VoteSet struct {
 	votesByBlock  map[string]*blockVotes
 }
 
+func NewVoteSet(height int64, round int32, typ VoteType, valSet *ValidatorSet) *VoteSet {
+	return &VoteSet{
+		height:        height,
+		round:         round,
+		typ:           typ,
+		valSet:        valSet,
+		votesBitArray: NewBitArray(valSet.Size()),
+		votes:         make([]*Vote, valSet.Size()),
+		sum:           0,
+		maj23:         nil,
+		votesByBlock:  map[string]*blockVotes{},
+	}
+}
+
+func (vs *VoteSet) HasAll() bool {
+	return vs.sum == vs.valSet.TotalVotingPower()
+}
+
 func (vs *VoteSet) getVote(valIdx int32, blockKey string) (vote *Vote, ok bool) {
 	if existing := vs.votes[valIdx]; existing != nil && existing.BlockID.Key() == blockKey {
 		return existing, true
@@ -184,30 +202,102 @@ func (vs *blockVotes) getByIndex(i int32) *Vote {
 	return vs.votes[i]
 }
 
-type HeightVoteSet struct{}
+type RoundVoteSet struct {
+	Prevotes   *VoteSet
+	Precommits *VoteSet
+}
 
-func NewHeightVoteSet(height int64, vs *ValidatorSet) *HeightVoteSet {
-	panic("not implemented")
+type HeightVoteSet struct {
+	height        int64
+	valSet        *ValidatorSet
+	round         int32
+	roundVoteSets map[int32]*RoundVoteSet
+}
+
+func NewHeightVoteSet(height int64, valSet *ValidatorSet) *HeightVoteSet {
+	hvs := &HeightVoteSet{}
+	hvs.Reset(height, valSet)
+	return hvs
+}
+
+func (hvs *HeightVoteSet) Reset(height int64, valSet *ValidatorSet) {
+	hvs.height = height
+	hvs.valSet = valSet
+	hvs.roundVoteSets = map[int32]*RoundVoteSet{}
+	hvs.addRound(0)
+	hvs.round = 0
 }
 
 func (hvs *HeightVoteSet) SetRound(round int32) {
-	panic("not implemented")
+	newRound := hvs.round - 1
+	if hvs.round != 0 && (round < newRound) {
+		panic("SetRound() must increment hvs.round")
+	}
+	for r := newRound; r <= round; r++ {
+		if _, ok := hvs.roundVoteSets[r]; ok {
+			continue // Already exists because peerCatchupRounds.
+		}
+		hvs.addRound(r)
+	}
+	hvs.round = round
 }
 
 func (hvs *HeightVoteSet) AddVote(vote *Vote) (added bool, err error) {
-	panic("not implemented")
+	// TODO: validate vote type
+	voteSet := hvs.getVoteSet(vote.Round, vote.Type)
+	if voteSet == nil {
+		// TODO: peerCatchupRounds?
+		hvs.addRound(vote.Round)
+		voteSet = hvs.getVoteSet(vote.Round, vote.Type)
+	}
+	added, err = voteSet.AddVote(vote)
+	return
 }
 
 func (hvs *HeightVoteSet) Prevotes(round int32) *VoteSet {
-	panic("not implemented")
+	return hvs.getVoteSet(round, Prevote)
 }
 
 func (hvs *HeightVoteSet) Precommits(round int32) *VoteSet {
-	panic("not implemented")
+	return hvs.getVoteSet(round, Precommit)
 }
 
 func (hvs *HeightVoteSet) POLInfo() (polRound int32, polBlockID BlockID) {
-	panic("not implemented")
+	for r := hvs.round; r >= 0; r-- {
+		rvs := hvs.getVoteSet(r, Prevote)
+		polBlockID, ok := rvs.TwoThirdsMajority()
+		if ok {
+			return r, polBlockID
+		}
+	}
+	return -1, BlockID{}
+}
+
+func (hvs *HeightVoteSet) getVoteSet(round int32, typ VoteType) *VoteSet {
+	rvs, ok := hvs.roundVoteSets[round]
+	if !ok {
+		return nil
+	}
+	switch typ {
+	case Prevote:
+		return rvs.Prevotes
+	case Precommit:
+		return rvs.Precommits
+	default:
+		panic(fmt.Sprintf("Unexpected vote type %X", typ))
+	}
+}
+
+func (hvs *HeightVoteSet) addRound(round int32) {
+	if _, ok := hvs.roundVoteSets[round]; ok {
+		panic("addRound() for an existing round")
+	}
+	prevotes := NewVoteSet(hvs.height, round, Prevote, hvs.valSet)
+	precommits := NewVoteSet(hvs.height, round, Precommit, hvs.valSet)
+	hvs.roundVoteSets[round] = &RoundVoteSet{
+		Prevotes:   prevotes,
+		Precommits: precommits,
+	}
 }
 
 func SignAndCheckVote(vote *Vote, privVal *PrivValidator) (bool, error) {

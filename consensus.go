@@ -14,6 +14,8 @@ type Machine struct {
 	config        Config
 	privValidator *types.PrivValidator
 
+	blockExec *BlockExecutor
+
 	State
 	state               ChainState
 	privValidatorPubKey types.PubKey
@@ -31,11 +33,13 @@ type Machine struct {
 func NewMachine(
 	config Config,
 	state ChainState,
+	blockExec *BlockExecutor,
 	incomingMsgQueue <-chan types.Message,
 	outgoingMsgQueue chan<- types.Message) *Machine {
 	m := &Machine{
 		config:           config,
 		state:            state,
+		blockExec:        blockExec,
 		incomingMsgQueue: incomingMsgQueue,
 		outgoingMsgQueue: outgoingMsgQueue,
 		internalMsgQueue: make(chan types.Message, 1),
@@ -50,9 +54,29 @@ func NewMachine(
 	return m
 }
 
+func (m *Machine) SetPrivValidator(priv *types.PrivValidator) {
+	m.privValidator = priv
+	if err := m.updatePrivValidatorPubKey(); err != nil {
+		log.Printf("error: failed to get priv validator pubkey: %v", err)
+	}
+}
+
+func (m *Machine) updatePrivValidatorPubKey() error {
+	if m.privValidator == nil {
+		return nil
+	}
+	pubKey, err := m.privValidator.GetPubKey()
+	if err != nil {
+		return err
+	}
+	m.privValidatorPubKey = pubKey
+	return nil
+}
+
 func (m *Machine) Start() {
 	m.StartTime = time.Now()
 	go m.run()
+	m.scheduleRound0()
 }
 
 func (m *Machine) Stop() {
@@ -190,6 +214,7 @@ func (m *Machine) setProposal(proposal *types.Proposal) error {
 		return errors.New("invalid proposal signature")
 	}
 	m.Proposal = proposal
+	m.ProposalBlock = proposal.Block // originally done in addProposalBlockPart
 	log.Printf("info: received proposal")
 	return nil
 }
@@ -197,10 +222,10 @@ func (m *Machine) setProposal(proposal *types.Proposal) error {
 func (m *Machine) handleMsg(msg types.Message) {
 	var err error
 	switch msg := msg.(type) {
-	case *types.ProposalMessage:
+	case types.ProposalMessage:
 		err = m.setProposal(msg.Proposal)
 	// TODO: handle BlockPartMessage?
-	case *types.VoteMessage:
+	case types.VoteMessage:
 		_, err = m.tryAddVote(msg.Vote)
 	default:
 		panic(fmt.Sprintf("invalid message type: %T", msg))
@@ -278,8 +303,11 @@ func (m *Machine) enterPropose(height int64, round int32) {
 		}
 	}()
 	m.ticker.SetTimeout(HRS{height, round, RoundStepPropose}, m.config.GetProposeTimeout(round))
-	// TODO: check if we're validator
-	address := types.Address{}
+	if m.privValidatorPubKey == nil {
+		log.Printf("error: propose step; empty priv validator public key")
+		return
+	}
+	address := m.privValidatorPubKey.Address()
 	if m.isProposer(address) {
 		log.Printf("info: our turn to propose")
 		m.decideProposal(height, round)
@@ -349,8 +377,8 @@ func (m *Machine) enterPrecommit(height int64, round int32) {
 		m.newStep()
 	}()
 	blockID, ok := m.Votes.Prevotes(round).TwoThirdsMajority()
-	if ok {
-		if m.LockedBlock == nil {
+	if !ok {
+		if m.LockedBlock != nil {
 			log.Printf("debug: precommit; no +2/3 prevotes while we are locked; precommiting nil")
 		} else {
 			log.Printf("debug: precommit; no +2/3 prevotes; precommiting nil")
@@ -372,7 +400,7 @@ func (m *Machine) enterPrecommit(height int64, round int32) {
 		m.signAddVote(types.Precommit, types.BlockID{})
 		return
 	}
-	if blockID == m.LockedBlock.ID {
+	if m.LockedBlock != nil && blockID == m.LockedBlock.ID {
 		log.Printf("debug: precommit; +2/3 prevoted locked block; relocking")
 		m.LockedRound = round
 		m.signAddVote(types.Precommit, blockID)
@@ -429,11 +457,11 @@ func (m *Machine) enterCommit(height int64, commitRound int32) {
 	if !ok {
 		panic("expected +2/3 precommits")
 	}
-	if blockID == m.LockedBlock.ID {
-		log.Printf("debug: commit is for a locked block")
+	if m.LockedBlock != nil && blockID == m.LockedBlock.ID {
+		log.Printf("debug: commit is for a locked block; set ProposalBlock=LockedBlock")
 		m.ProposalBlock = m.LockedBlock
 	}
-	if m.ProposalBlock.ID != blockID {
+	if m.ProposalBlock == nil || m.ProposalBlock.ID != blockID {
 		log.Printf("info: commit is for a block we don't know about; set ProposalBlock=nil")
 		m.ProposalBlock = nil
 		// TODO: broadcast valid block?
@@ -449,7 +477,7 @@ func (m *Machine) tryFinalizeCommit(height int64) {
 		log.Printf("error: failed attempt to finalize commit; there was no +2/3 majority or +2/3 was for nil")
 		return
 	}
-	if m.ProposalBlock.ID != blockID {
+	if m.ProposalBlock == nil || m.ProposalBlock.ID != blockID {
 		log.Printf("debug: failed attempt to finalize commit; we do not have the commit block")
 		return
 	}
@@ -472,9 +500,9 @@ func (m *Machine) finalizeCommit(height int64) {
 	// ValidateBlock()
 	log.Printf("info: commited block: %v", blockID)
 	// ApplyBlock()
-	newState := m.state
-	m.updateToState(newState)
-	// TODO: updatePrivValidatorPubKey
+	stateCopy := m.state
+	stateCopy.LastBlockHeight++
+	m.updateToState(stateCopy)
 	m.scheduleRound0()
 }
 
@@ -494,10 +522,11 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 		}
 		log.Printf("debug: added vote to last commit: %v", vote)
 		// TODO: broadcast vote
-		//if m.config.SkipCommitTimeout && m.LastCommit.HasAll() {
-		//	m.enterNewRound(m.Height, 0)
-		//}
-		return true, err
+		m.outgoingMsgQueue <- types.VoteMessage{Vote: vote}
+		if m.config.SkipCommitTimeout && m.LastCommit.HasAll() {
+			m.enterNewRound(m.Height, 0)
+		}
+		return added, err
 	}
 	if vote.Height != m.Height {
 		log.Printf("debug: vote ignored: %d < %d", vote.Height, m.Height)
@@ -508,6 +537,7 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 		return false, err
 	}
 	// TODO: broadcast vote
+	m.outgoingMsgQueue <- types.VoteMessage{Vote: vote}
 
 	switch vote.Type {
 	case types.Prevote:
@@ -525,8 +555,14 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 			if !blockID.Empty() &&
 				(m.ValidRound < vote.Round) &&
 				(vote.Round == m.Round) {
-				m.ValidRound = vote.Round
-				m.ValidBlock = m.ProposalBlock
+				if m.ProposalBlock.ID == blockID {
+					log.Printf("debug: updating valid block because of POL")
+					m.ValidRound = vote.Round
+					m.ValidBlock = m.ProposalBlock
+				} else {
+					log.Printf("debug: valid block we do not know about; set ProposalBlock=nil")
+					m.ProposalBlock = nil
+				}
 			} else {
 				log.Printf("debug: valid block we do not know about")
 				m.ProposalBlock = nil
@@ -560,9 +596,9 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 
 			if !blockID.Empty() {
 				m.enterCommit(m.Height, vote.Round)
-				//if m.config.SkipCommitTimeout && precommits.HasAll() {
-				//	m.enterNewRound(m.Height, 0)
-				//}
+				if m.config.SkipCommitTimeout && precommits.HasAll() {
+					m.enterNewRound(m.Height, 0)
+				}
 			} else {
 				m.enterPrecommitWait(m.Height, vote.Round)
 			}
@@ -577,10 +613,13 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 }
 
 func (m *Machine) signAddVote(typ types.VoteType, blockID types.BlockID) {
-	// TODO: check if we're validator
-	addr := types.Address{}
-	if !m.Validators.HasAddress(addr) {
-		// Node is not in the validator set
+	if m.privValidator == nil {
+		return
+	}
+	if m.privValidatorPubKey == nil {
+		return
+	}
+	if !m.Validators.HasAddress(m.privValidatorPubKey.Address()) {
 		return
 	}
 	vote, err := m.signVote(typ, blockID)
@@ -645,8 +684,7 @@ func (m *Machine) decideProposal(height int64, round int32) {
 			panic("Method createProposalBlock should not provide a nil block without errors")
 		}
 	}
-	propBlockID := types.BlockID{} // TODO: implement
-	proposal := types.NewProposal(height, round, m.ValidRound, propBlockID)
+	proposal := types.NewProposal(height, round, m.ValidRound, block.ID, block)
 	if err := m.privValidator.SignProposal(proposal); err == nil {
 		m.sendInternalMsg(types.ProposalMessage{Proposal: proposal})
 		log.Printf("debug: signed proposal")
@@ -663,7 +701,12 @@ func (m *Machine) createProposalBlock() (*types.Block, error) {
 		return nil, fmt.Errorf("propose step; empty priv validator public key")
 	}
 	// CreateProposalBlock()
-	return &types.Block{}, nil // TODO: implement
+	proposerAddr := m.privValidatorPubKey.Address()
+	block, err := m.blockExec.CreateProposalBlock(m.Height, m.state, proposerAddr)
+	if err != nil {
+		panic(err)
+	}
+	return block, nil
 }
 
 func (m *Machine) isProposer(addr types.Address) bool {

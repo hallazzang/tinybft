@@ -25,6 +25,16 @@ type Vote struct {
 	Signature        []byte
 }
 
+func (vote *Vote) Canonicalize() CanonicalVote {
+	return CanonicalVote{
+		Type:      vote.Type,
+		Height:    vote.Height,
+		Round:     vote.Round,
+		BlockID:   vote.BlockID,
+		Timestamp: vote.Timestamp,
+	}
+}
+
 func (vote *Vote) Verify(pubKey PubKey) error {
 	if !pubKey.Address().Equal(vote.ValidatorAddress) {
 		return errors.New("invalid validator address")
@@ -36,9 +46,18 @@ func (vote *Vote) Verify(pubKey PubKey) error {
 }
 
 func (vote *Vote) SignBytes() []byte {
+	pb := vote.Canonicalize()
 	buf := &bytes.Buffer{}
-	if err := gob.NewEncoder(buf).Encode(vote); err != nil {
+	if err := gob.NewEncoder(buf).Encode(pb); err != nil {
 		panic("encode vote")
 	}
 	return buf.Bytes()
+}
+
+type CanonicalVote struct {
+	Type      VoteType
+	Height    int64
+	Round     int32
+	BlockID   BlockID
+	Timestamp time.Time
 }

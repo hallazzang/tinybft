@@ -38,6 +38,10 @@ func NewPrivValidator() *PrivValidator {
 	}
 }
 
+func (pv *PrivValidator) GetPubKey() (PubKey, error) {
+	return &ed25519PubKey{pv.PrivKey.Public().(ed25519.PublicKey)}, nil
+}
+
 func (pv *PrivValidator) SignVote(vote *Vote) error {
 	signBytes := vote.SignBytes()
 	sig := ed25519.Sign(pv.PrivKey, signBytes)
