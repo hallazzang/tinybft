@@ -38,7 +38,7 @@ func (bus *MessageBus) Subscribe() (ch <-chan Message, closeCh func()) {
 		for msg := range psCh {
 			msg, err := UnmarshalMessage([]byte(msg.Payload))
 			if err != nil {
-				panic(msg)
+				panic(err)
 			}
 			msgCh <- msg
 		}

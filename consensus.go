@@ -3,8 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/hallazzang/tinybft/types"
 )
@@ -27,6 +28,8 @@ type Machine struct {
 
 	quit chan struct{}
 	done chan struct{}
+
+	logger zerolog.Logger
 }
 
 // OK
@@ -46,6 +49,7 @@ func NewMachine(
 		ticker:           NewTicker(),
 		quit:             make(chan struct{}),
 		done:             make(chan struct{}),
+		logger:           zerolog.Nop(),
 	}
 	if state.LastBlockHeight > 0 {
 		panic("reconstructing last commit is not implemented")
@@ -57,7 +61,7 @@ func NewMachine(
 func (m *Machine) SetPrivValidator(priv *types.PrivValidator) {
 	m.privValidator = priv
 	if err := m.updatePrivValidatorPubKey(); err != nil {
-		log.Printf("error: failed to get priv validator pubkey: %v", err)
+		m.logger.Error().Err(err).Msg("failed to get priv validator pubkey")
 	}
 }
 
@@ -71,6 +75,10 @@ func (m *Machine) updatePrivValidatorPubKey() error {
 	}
 	m.privValidatorPubKey = pubKey
 	return nil
+}
+
+func (m *Machine) SetLogger(logger zerolog.Logger) {
+	m.logger = logger
 }
 
 func (m *Machine) Start() {
@@ -107,7 +115,7 @@ func (m *Machine) updateToState(state ChainState) {
 			panic(fmt.Sprintf("..."))
 		}
 		if state.LastBlockHeight <= m.state.LastBlockHeight {
-			log.Printf("debug: ignoring updateToState()")
+			m.logger.Debug().Msg("ignoring updateToState()")
 			m.newStep()
 			return
 		}
@@ -215,7 +223,7 @@ func (m *Machine) setProposal(proposal *types.Proposal) error {
 	}
 	m.Proposal = proposal
 	m.ProposalBlock = proposal.Block // originally done in addProposalBlockPart
-	log.Printf("info: received proposal")
+	m.logger.Info().Msg("received proposal")
 	return nil
 }
 
@@ -231,7 +239,7 @@ func (m *Machine) handleMsg(msg types.Message) {
 		panic(fmt.Sprintf("invalid message type: %T", msg))
 	}
 	if err != nil {
-		log.Printf("error: failed to handle message: %v", err)
+		m.logger.Error().Err(err).Msg("failed to handle message")
 	}
 }
 
@@ -239,7 +247,7 @@ func (m *Machine) handleTimeout(hrs HRS) {
 	if hrs.Height != m.Height ||
 		hrs.Round < m.Round ||
 		(hrs.Round == m.Round && hrs.Step < m.Step) {
-		log.Printf("debug: ignoring timeout because we are ahead")
+		m.logger.Debug().Msg("ignoring timeout because we are ahead")
 		return
 	}
 	switch hrs.Step {
@@ -263,13 +271,14 @@ func (m *Machine) enterNewRound(height int64, round int32) {
 	if m.Height != height ||
 		round < m.Round ||
 		(m.Round == round && m.Step != RoundStepNewHeight) {
-		log.Printf("error: entering new round with invalid args")
+		m.logger.Error().
+			Int64("m.Height", m.Height).Int64("height", height).
+			Int32("round", round).Int32("m.Round", m.Round).
+			Str("m.Step", m.Step.String()).Msg(".")
+		m.logger.Error().Msg("entering new round with invalid args")
 		return
 	}
-	log.Printf("info: entering new round: %d/%d", height, round)
-	if m.Round < round {
-		// TODO: increment proposer priority
-	}
+	m.logger.Info().Msgf("entering new round: %d/%d", height, round)
 	validators := m.Validators
 	if m.Round < round {
 		validators = validators.Copy()
@@ -291,10 +300,10 @@ func (m *Machine) enterPropose(height int64, round int32) {
 	if m.Height != height ||
 		round < m.Round ||
 		(m.Round == round && RoundStepPropose <= m.Step) {
-		log.Printf("error: entering propose step with invalid args")
+		m.logger.Error().Msg("entering propose step with invalid args")
 		return
 	}
-	log.Printf("info: entering propose step")
+	m.logger.Info().Msg("entering propose step")
 	defer func() {
 		m.updateRoundStep(round, RoundStepPropose)
 		m.newStep()
@@ -304,15 +313,15 @@ func (m *Machine) enterPropose(height int64, round int32) {
 	}()
 	m.ticker.SetTimeout(HRS{height, round, RoundStepPropose}, m.config.GetProposeTimeout(round))
 	if m.privValidatorPubKey == nil {
-		log.Printf("error: propose step; empty priv validator public key")
+		m.logger.Error().Msg("propose step; empty priv validator public key")
 		return
 	}
 	address := m.privValidatorPubKey.Address()
 	if m.isProposer(address) {
-		log.Printf("info: our turn to propose")
+		m.logger.Info().Msg("our turn to propose")
 		m.decideProposal(height, round)
 	} else {
-		log.Printf("debug: not our turn to propose")
+		m.logger.Debug().Msg("not our turn to propose")
 	}
 }
 
@@ -320,22 +329,22 @@ func (m *Machine) enterPrevote(height int64, round int32) {
 	if m.Height != height ||
 		round < m.Round ||
 		(m.Round == round && RoundStepPrevote <= m.Step) {
-		log.Printf("error: entering prevote step with invalid args")
+		m.logger.Error().Msg("entering prevote step with invalid args")
 		return
 	}
-	log.Printf("info: entering prevote step")
+	m.logger.Info().Msg("entering prevote step")
 	defer func() {
 		m.updateRoundStep(round, RoundStepPrevote)
 		m.newStep()
 	}()
 	// doPrevote
 	if m.LockedBlock != nil {
-		log.Printf("debug: prevote; already locked; prevoting locked block")
+		m.logger.Debug().Msg("prevote; already locked; prevoting locked block")
 		m.signAddVote(types.Prevote, m.LockedBlock.ID)
 		return
 	}
 	if m.ProposalBlock == nil {
-		log.Printf("debug: prevote; ProposalBlock is nil")
+		m.logger.Debug().Msg("prevote; ProposalBlock is nil")
 		m.signAddVote(types.Prevote, types.BlockID{})
 		return
 	}
@@ -348,7 +357,7 @@ func (m *Machine) enterPrevoteWait(height int64, round int32) {
 	if m.Height != height ||
 		round < m.Round ||
 		(m.Round == round && RoundStepPrevoteWait <= m.Step) {
-		log.Printf("error: entering prevote wait step with invalid args")
+		m.logger.Error().Msg("entering prevote wait step with invalid args")
 		return
 	}
 	if !m.Votes.Prevotes(round).HasTwoThirdsAny() {
@@ -356,7 +365,7 @@ func (m *Machine) enterPrevoteWait(height int64, round int32) {
 			"entering prevote wait step (%d/%d), but prevotes does not have any +2/3 votes",
 			height, round))
 	}
-	log.Printf("info: entering prevote wait step")
+	m.logger.Info().Msg("entering prevote wait step")
 	defer func() {
 		m.updateRoundStep(round, RoundStepPrevoteWait)
 		m.newStep()
@@ -368,10 +377,10 @@ func (m *Machine) enterPrecommit(height int64, round int32) {
 	if m.Height != height ||
 		round < m.Round ||
 		(m.Round == round && RoundStepPrecommit <= m.Step) {
-		log.Printf("error: entering precommit step with invalid args")
+		m.logger.Error().Msg("entering precommit step with invalid args")
 		return
 	}
-	log.Printf("info: entering precommit step")
+	m.logger.Info().Msg("entering precommit step")
 	defer func() {
 		m.updateRoundStep(round, RoundStepPrecommit)
 		m.newStep()
@@ -379,9 +388,9 @@ func (m *Machine) enterPrecommit(height int64, round int32) {
 	blockID, ok := m.Votes.Prevotes(round).TwoThirdsMajority()
 	if !ok {
 		if m.LockedBlock != nil {
-			log.Printf("debug: precommit; no +2/3 prevotes while we are locked; precommiting nil")
+			m.logger.Debug().Msg("precommit; no +2/3 prevotes while we are locked; precommiting nil")
 		} else {
-			log.Printf("debug: precommit; no +2/3 prevotes; precommiting nil")
+			m.logger.Debug().Msg("precommit; no +2/3 prevotes; precommiting nil")
 		}
 		m.signAddVote(types.Precommit, types.BlockID{})
 		return
@@ -392,29 +401,29 @@ func (m *Machine) enterPrecommit(height int64, round int32) {
 	}
 	if blockID.Empty() {
 		if m.LockedBlock == nil {
-			log.Printf("debug: precommit; +2/3 prevoted for nil")
+			m.logger.Debug().Msg("precommit; +2/3 prevoted for nil")
 		} else {
-			log.Printf("debug: precommit; +2/3 prevoted for nil; unlocking")
+			m.logger.Debug().Msg("precommit; +2/3 prevoted for nil; unlocking")
 			m.Unlock()
 		}
 		m.signAddVote(types.Precommit, types.BlockID{})
 		return
 	}
 	if m.LockedBlock != nil && blockID == m.LockedBlock.ID {
-		log.Printf("debug: precommit; +2/3 prevoted locked block; relocking")
+		m.logger.Debug().Msg("precommit; +2/3 prevoted locked block; relocking")
 		m.LockedRound = round
 		m.signAddVote(types.Precommit, blockID)
 		return
 	}
 	if blockID == m.ProposalBlock.ID {
-		log.Printf("debug: precommit; +2/3 prevoted proposal block; locking")
+		m.logger.Debug().Msg("precommit; +2/3 prevoted proposal block; locking")
 		// TODO: validate block
 		m.LockedRound = round
 		m.LockedBlock = m.ProposalBlock
 		m.signAddVote(types.Precommit, blockID)
 		return
 	}
-	log.Printf("debug: precommit; +2/3 prevotes for a block we don't have; voting nil")
+	m.logger.Debug().Msg("precommit; +2/3 prevotes for a block we don't have; voting nil")
 	m.Unlock()
 	m.signAddVote(types.Precommit, types.BlockID{})
 }
@@ -423,7 +432,7 @@ func (m *Machine) enterPrecommitWait(height int64, round int32) {
 	if m.Height != height ||
 		round < m.Round ||
 		(m.Round == round && m.TriggeredPrecommitTimeout) {
-		log.Printf("error: entering precommit step with invalid args")
+		m.logger.Error().Msg("entering precommit step with invalid args")
 		return
 	}
 	if !m.Votes.Precommits(round).HasTwoThirdsAny() {
@@ -431,7 +440,7 @@ func (m *Machine) enterPrecommitWait(height int64, round int32) {
 			"entering precommit wait step (%d/%d), but precommits does not have any +2/3 votes",
 			height, round))
 	}
-	log.Printf("info: entering precommit wait step")
+	m.logger.Info().Msg("entering precommit wait step")
 	defer func() {
 		m.TriggeredPrecommitTimeout = true
 		m.newStep()
@@ -441,10 +450,10 @@ func (m *Machine) enterPrecommitWait(height int64, round int32) {
 
 func (m *Machine) enterCommit(height int64, commitRound int32) {
 	if m.Height != height || RoundStepCommit <= m.Step {
-		log.Printf("error: entering precommit step with invalid args")
+		m.logger.Error().Msg("entering precommit step with invalid args")
 		return
 	}
-	log.Printf("info: entering commit step")
+	m.logger.Info().Msg("entering commit step")
 	defer func() {
 		m.updateRoundStep(m.Round, RoundStepCommit)
 		m.CommitRound = commitRound
@@ -458,11 +467,11 @@ func (m *Machine) enterCommit(height int64, commitRound int32) {
 		panic("expected +2/3 precommits")
 	}
 	if m.LockedBlock != nil && blockID == m.LockedBlock.ID {
-		log.Printf("debug: commit is for a locked block; set ProposalBlock=LockedBlock")
+		m.logger.Debug().Msg("commit is for a locked block; set ProposalBlock=LockedBlock")
 		m.ProposalBlock = m.LockedBlock
 	}
 	if m.ProposalBlock == nil || m.ProposalBlock.ID != blockID {
-		log.Printf("info: commit is for a block we don't know about; set ProposalBlock=nil")
+		m.logger.Info().Msg("commit is for a block we don't know about; set ProposalBlock=nil")
 		m.ProposalBlock = nil
 		// TODO: broadcast valid block?
 	}
@@ -474,11 +483,11 @@ func (m *Machine) tryFinalizeCommit(height int64) {
 	}
 	blockID, ok := m.Votes.Precommits(m.CommitRound).TwoThirdsMajority()
 	if !ok || blockID.Empty() {
-		log.Printf("error: failed attempt to finalize commit; there was no +2/3 majority or +2/3 was for nil")
+		m.logger.Error().Msg("failed attempt to finalize commit; there was no +2/3 majority or +2/3 was for nil")
 		return
 	}
 	if m.ProposalBlock == nil || m.ProposalBlock.ID != blockID {
-		log.Printf("debug: failed attempt to finalize commit; we do not have the commit block")
+		m.logger.Debug().Msg("failed attempt to finalize commit; we do not have the commit block")
 		return
 	}
 	m.finalizeCommit(height)
@@ -486,7 +495,7 @@ func (m *Machine) tryFinalizeCommit(height int64) {
 
 func (m *Machine) finalizeCommit(height int64) {
 	if m.Height != height || m.Step != RoundStepCommit {
-		log.Printf("error: entering finalize commit step with invalid args")
+		m.logger.Error().Msg("entering finalize commit step with invalid args")
 		return
 	}
 	blockID, ok := m.Votes.Precommits(m.CommitRound).TwoThirdsMajority()
@@ -498,7 +507,7 @@ func (m *Machine) finalizeCommit(height int64) {
 		panic("cannot finalize commit; proposal block does not hash to commit hash")
 	}
 	// ValidateBlock()
-	log.Printf("info: commited block: %v", blockID)
+	m.logger.Info().Any("block_id", blockID).Msg("commited block")
 	// ApplyBlock()
 	stateCopy := m.state
 	stateCopy.LastBlockHeight++
@@ -513,14 +522,14 @@ func (m *Machine) tryAddVote(vote *types.Vote) (added bool, err error) {
 func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 	if vote.Height+1 == m.Height && vote.Type == types.Precommit {
 		if m.Step != RoundStepNewHeight {
-			log.Printf("debug: ignoring vote: %v", vote)
+			m.logger.Debug().Any("vote", vote).Msg("ignoring vote")
 			return false, nil
 		}
 		added, err = m.LastCommit.AddVote(vote)
 		if !added {
 			return false, err
 		}
-		log.Printf("debug: added vote to last commit: %v", vote)
+		m.logger.Debug().Any("vote", vote).Msg("added vote to last commit")
 		// TODO: broadcast vote
 		m.outgoingMsgQueue <- types.VoteMessage{Vote: vote}
 		if m.config.SkipCommitTimeout && m.LastCommit.HasAll() {
@@ -529,7 +538,7 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 		return added, err
 	}
 	if vote.Height != m.Height {
-		log.Printf("debug: vote ignored: %d < %d", vote.Height, m.Height)
+		m.logger.Debug().Msgf("vote ignored: %d < %d", vote.Height, m.Height)
 		return false, nil
 	}
 	added, err = m.Votes.AddVote(vote)
@@ -542,13 +551,13 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 	switch vote.Type {
 	case types.Prevote:
 		prevotes := m.Votes.Prevotes(vote.Round)
-		log.Printf("debug: added vote to prevote: %v", vote)
+		m.logger.Debug().Any("vote", vote).Msg("added vote to prevote")
 		if blockID, ok := prevotes.TwoThirdsMajority(); ok {
 			if (m.LockedBlock != nil) &&
 				(m.LockedRound < vote.Round) &&
 				(vote.Round <= m.Round) &&
 				m.LockedBlock.ID != blockID {
-				log.Printf("debug: unlocking because of PoL")
+				m.logger.Debug().Msg("unlocking because of PoL")
 				m.Unlock()
 			}
 
@@ -556,15 +565,15 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 				(m.ValidRound < vote.Round) &&
 				(vote.Round == m.Round) {
 				if m.ProposalBlock.ID == blockID {
-					log.Printf("debug: updating valid block because of POL")
+					m.logger.Debug().Msg("updating valid block because of POL")
 					m.ValidRound = vote.Round
 					m.ValidBlock = m.ProposalBlock
 				} else {
-					log.Printf("debug: valid block we do not know about; set ProposalBlock=nil")
+					m.logger.Debug().Msg("valid block we do not know about; set ProposalBlock=nil")
 					m.ProposalBlock = nil
 				}
 			} else {
-				log.Printf("debug: valid block we do not know about")
+				m.logger.Debug().Msg("valid block we do not know about")
 				m.ProposalBlock = nil
 			}
 
@@ -588,7 +597,7 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 		}
 	case types.Precommit:
 		precommits := m.Votes.Precommits(vote.Round)
-		log.Printf("debug: added vote to precommit: %v", vote)
+		m.logger.Debug().Any("vote", vote).Msg("added vote to precommit")
 		blockID, ok := precommits.TwoThirdsMajority()
 		if ok {
 			m.enterNewRound(m.Height, vote.Round)
@@ -624,11 +633,11 @@ func (m *Machine) signAddVote(typ types.VoteType, blockID types.BlockID) {
 	}
 	vote, err := m.signVote(typ, blockID)
 	if err != nil {
-		log.Printf("error: failed to sign vote")
+		m.logger.Error().Err(err).Msg("failed to sign vote")
 		return
 	}
 	m.sendInternalMsg(types.VoteMessage{Vote: vote})
-	log.Printf("signed and pushed vote")
+	m.logger.Info().Msg("signed and pushed vote")
 }
 
 func (m *Machine) signVote(typ types.VoteType, blockID types.BlockID) (*types.Vote, error) {
@@ -678,7 +687,7 @@ func (m *Machine) decideProposal(height int64, round int32) {
 		var err error
 		block, err = m.createProposalBlock()
 		if err != nil {
-			log.Printf("error: unable to create proposal block: %v", err)
+			m.logger.Error().Err(err).Msg("unable to create proposal block: %v")
 			return
 		} else if block == nil {
 			panic("Method createProposalBlock should not provide a nil block without errors")
@@ -687,9 +696,9 @@ func (m *Machine) decideProposal(height int64, round int32) {
 	proposal := types.NewProposal(height, round, m.ValidRound, block.ID, block)
 	if err := m.privValidator.SignProposal(proposal); err == nil {
 		m.sendInternalMsg(types.ProposalMessage{Proposal: proposal})
-		log.Printf("debug: signed proposal")
+		m.logger.Debug().Msg("signed proposal")
 	} else {
-		log.Printf("error: propose step; failed signing proposal")
+		m.logger.Error().Err(err).Msg("propose step; failed signing proposal")
 	}
 }
 

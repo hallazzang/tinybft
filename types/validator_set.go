@@ -87,6 +87,7 @@ func (vs *ValidatorSet) Copy() *ValidatorSet {
 	}
 }
 
+// TODO: is it correct mock implementation?
 func (vs *ValidatorSet) IncrementProposerPriority(times int32) {
 	vs.i = (vs.i + int(times)) % len(vs.Validators)
 }

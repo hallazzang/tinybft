@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/hallazzang/tinybft/types"
@@ -18,6 +19,29 @@ const (
 	RoundStepPrecommitWait = RoundStep(7)
 	RoundStepCommit        = RoundStep(8)
 )
+
+func (step RoundStep) String() string {
+	switch step {
+	case RoundStepNewHeight:
+		return "RoundStepNewHeight"
+	case RoundStepNewRound:
+		return "RoundStepNewRound"
+	case RoundStepPropose:
+		return "RoundStepPropose"
+	case RoundStepPrevote:
+		return "RoundStepPrevote"
+	case RoundStepPrevoteWait:
+		return "RoundStepPrevoteWait"
+	case RoundStepPrecommit:
+		return "RoundStepPrecommit"
+	case RoundStepPrecommitWait:
+		return "RoundStepPrecommitWait"
+	case RoundStepCommit:
+		return "RoundStepCommit"
+	default:
+		return fmt.Sprintf("RoundStep(%d)", step)
+	}
+}
 
 type State struct {
 	HRS

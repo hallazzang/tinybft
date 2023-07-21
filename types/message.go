@@ -1,7 +1,8 @@
 package types
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/gob"
 )
 
 var (
@@ -9,15 +10,25 @@ var (
 	_ Message = VoteMessage{}
 )
 
+func init() {
+	gob.Register((*Message)(nil))
+	gob.Register(ProposalMessage{})
+	gob.Register(VoteMessage{})
+}
+
 type Message interface{}
 
 func MarshalMessage(msg Message) ([]byte, error) {
-	return json.Marshal(msg)
+	buf := &bytes.Buffer{}
+	if err := gob.NewEncoder(buf).Encode(&msg); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func UnmarshalMessage(b []byte) (Message, error) {
 	var msg Message
-	if err := json.Unmarshal(b, &msg); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&msg); err != nil {
 		return nil, err
 	}
 	return msg, nil

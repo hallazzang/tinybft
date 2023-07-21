@@ -49,7 +49,7 @@ func (pv *PrivValidator) SignVote(vote *Vote) error {
 	return nil
 }
 
-func (pv *PrivValidator) SignProposal(proposal *Proposal) interface{} {
+func (pv *PrivValidator) SignProposal(proposal *Proposal) error {
 	signBytes := proposal.SignBytes()
 	sig := ed25519.Sign(pv.PrivKey, signBytes)
 	proposal.Signature = sig
