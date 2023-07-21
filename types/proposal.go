@@ -1,8 +1,8 @@
 package types
 
 import (
-	"bytes"
-	"encoding/gob"
+	"encoding/json"
+	"fmt"
 )
 
 type Proposal struct {
@@ -36,11 +36,11 @@ func (p *Proposal) Canonicalize() CanonicalProposal {
 
 func (p *Proposal) SignBytes() []byte {
 	pb := p.Canonicalize()
-	buf := &bytes.Buffer{}
-	if err := gob.NewEncoder(buf).Encode(pb); err != nil {
-		panic("encode vote")
+	bz, err := json.Marshal(pb)
+	if err != nil {
+		panic(fmt.Errorf("marshal proposal: %w", err))
 	}
-	return buf.Bytes()
+	return bz
 }
 
 type CanonicalProposal struct {

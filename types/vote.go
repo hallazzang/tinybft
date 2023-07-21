@@ -1,9 +1,9 @@
 package types
 
 import (
-	"bytes"
-	"encoding/gob"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -47,11 +47,11 @@ func (vote *Vote) Verify(pubKey PubKey) error {
 
 func (vote *Vote) SignBytes() []byte {
 	pb := vote.Canonicalize()
-	buf := &bytes.Buffer{}
-	if err := gob.NewEncoder(buf).Encode(pb); err != nil {
-		panic("encode vote")
+	bz, err := json.Marshal(pb)
+	if err != nil {
+		panic(fmt.Errorf("marshal vote: %w", err))
 	}
-	return buf.Bytes()
+	return bz
 }
 
 type CanonicalVote struct {
