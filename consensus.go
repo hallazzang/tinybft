@@ -82,7 +82,6 @@ func (m *Machine) SetLogger(logger zerolog.Logger) {
 }
 
 func (m *Machine) Start() {
-	m.StartTime = time.Now()
 	go m.run()
 	m.scheduleRound0()
 }
@@ -271,10 +270,6 @@ func (m *Machine) enterNewRound(height int64, round int32) {
 	if m.Height != height ||
 		round < m.Round ||
 		(m.Round == round && m.Step != RoundStepNewHeight) {
-		m.logger.Error().
-			Int64("m.Height", m.Height).Int64("height", height).
-			Int32("round", round).Int32("m.Round", m.Round).
-			Str("m.Step", m.Step.String()).Msg(".")
 		m.logger.Error().Msg("entering new round with invalid args")
 		return
 	}
@@ -312,11 +307,19 @@ func (m *Machine) enterPropose(height int64, round int32) {
 		}
 	}()
 	m.ticker.SetTimeout(HRS{height, round, RoundStepPropose}, m.config.GetProposeTimeout(round))
+	if m.privValidator == nil {
+		m.logger.Debug().Msg("node is not a validator")
+		return
+	}
 	if m.privValidatorPubKey == nil {
 		m.logger.Error().Msg("propose step; empty priv validator public key")
 		return
 	}
 	address := m.privValidatorPubKey.Address()
+	if !m.Validators.HasAddress(address) {
+		m.logger.Debug().Msg("node is not a validator")
+		return
+	}
 	if m.isProposer(address) {
 		m.logger.Info().Msg("our turn to propose")
 		m.decideProposal(height, round)
@@ -409,13 +412,13 @@ func (m *Machine) enterPrecommit(height int64, round int32) {
 		m.signAddVote(types.Precommit, types.BlockID{})
 		return
 	}
-	if m.LockedBlock != nil && blockID == m.LockedBlock.ID {
+	if m.LockedBlock.HashesTo(blockID) {
 		m.logger.Debug().Msg("precommit; +2/3 prevoted locked block; relocking")
 		m.LockedRound = round
 		m.signAddVote(types.Precommit, blockID)
 		return
 	}
-	if blockID == m.ProposalBlock.ID {
+	if m.ProposalBlock.HashesTo(blockID) {
 		m.logger.Debug().Msg("precommit; +2/3 prevoted proposal block; locking")
 		// TODO: validate block
 		m.LockedRound = round
@@ -466,12 +469,12 @@ func (m *Machine) enterCommit(height int64, commitRound int32) {
 	if !ok {
 		panic("expected +2/3 precommits")
 	}
-	if m.LockedBlock != nil && blockID == m.LockedBlock.ID {
+	if m.LockedBlock.HashesTo(blockID) {
 		m.logger.Debug().Msg("commit is for a locked block; set ProposalBlock=LockedBlock")
 		m.ProposalBlock = m.LockedBlock
 	}
-	if m.ProposalBlock == nil || m.ProposalBlock.ID != blockID {
-		m.logger.Info().Msg("commit is for a block we don't know about; set ProposalBlock=nil")
+	if !m.ProposalBlock.HashesTo(blockID) {
+		m.logger.Info().Msg("commit is for a block we do not know about; set ProposalBlock=nil")
 		m.ProposalBlock = nil
 		// TODO: broadcast valid block?
 	}
@@ -522,15 +525,14 @@ func (m *Machine) tryAddVote(vote *types.Vote) (added bool, err error) {
 func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 	if vote.Height+1 == m.Height && vote.Type == types.Precommit {
 		if m.Step != RoundStepNewHeight {
-			m.logger.Debug().Any("vote", vote).Msg("ignoring vote")
+			m.logger.Debug().Any("vote", vote).Msg("precommit vote came in after commit timeout and has been ignored")
 			return false, nil
 		}
 		added, err = m.LastCommit.AddVote(vote)
 		if !added {
 			return false, err
 		}
-		m.logger.Debug().Any("vote", vote).Msg("added vote to last commit")
-		// TODO: broadcast vote
+		m.logger.Debug().Any("vote", vote).Msg("added vote to last precommits")
 		m.outgoingMsgQueue <- types.VoteMessage{Vote: vote}
 		if m.config.SkipCommitTimeout && m.LastCommit.HasAll() {
 			m.enterNewRound(m.Height, 0)
@@ -538,14 +540,13 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 		return added, err
 	}
 	if vote.Height != m.Height {
-		m.logger.Debug().Msgf("vote ignored: %d < %d", vote.Height, m.Height)
+		m.logger.Debug().Msgf("vote ignored and not added: %d != %d", vote.Height, m.Height)
 		return false, nil
 	}
 	added, err = m.Votes.AddVote(vote)
 	if !added {
 		return false, err
 	}
-	// TODO: broadcast vote
 	m.outgoingMsgQueue <- types.VoteMessage{Vote: vote}
 
 	switch vote.Type {
@@ -556,7 +557,7 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 			if (m.LockedBlock != nil) &&
 				(m.LockedRound < vote.Round) &&
 				(vote.Round <= m.Round) &&
-				m.LockedBlock.ID != blockID {
+				!m.LockedBlock.HashesTo(blockID) {
 				m.logger.Debug().Msg("unlocking because of PoL")
 				m.Unlock()
 			}
@@ -564,7 +565,7 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 			if !blockID.Empty() &&
 				(m.ValidRound < vote.Round) &&
 				(vote.Round == m.Round) {
-				if m.ProposalBlock.ID == blockID {
+				if m.ProposalBlock.HashesTo(blockID) {
 					m.logger.Debug().Msg("updating valid block because of POL")
 					m.ValidRound = vote.Round
 					m.ValidBlock = m.ProposalBlock
@@ -572,12 +573,8 @@ func (m *Machine) addVote(vote *types.Vote) (added bool, err error) {
 					m.logger.Debug().Msg("valid block we do not know about; set ProposalBlock=nil")
 					m.ProposalBlock = nil
 				}
-			} else {
-				m.logger.Debug().Msg("valid block we do not know about")
-				m.ProposalBlock = nil
+				// TODO: broadcast valid block
 			}
-
-			// TODO: broadcast valid block
 		}
 
 		switch {
@@ -696,7 +693,8 @@ func (m *Machine) decideProposal(height int64, round int32) {
 	proposal := types.NewProposal(height, round, m.ValidRound, block.ID, block)
 	if err := m.privValidator.SignProposal(proposal); err == nil {
 		m.sendInternalMsg(types.ProposalMessage{Proposal: proposal})
-		m.logger.Debug().Msg("signed proposal")
+		m.outgoingMsgQueue <- types.ProposalMessage{Proposal: proposal} // also send to others
+		m.logger.Debug().Any("proposal", proposal).Msg("signed proposal")
 	} else {
 		m.logger.Error().Err(err).Msg("propose step; failed signing proposal")
 	}

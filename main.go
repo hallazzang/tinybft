@@ -29,8 +29,6 @@ func main() {
 
 	privVal1, val1 := newValidator(10000)
 	privVal2, val2 := newValidator(10000)
-	privVal3, val3 := newValidator(10000)
-	privVal4, val4 := newValidator(10000)
 	blockExec := NewBlockExecutor()
 
 	redisClient := redis.NewClient(&redis.Options{
@@ -49,8 +47,8 @@ func main() {
 		}
 	}()
 
-	vals := []*types.Validator{val1, val2, val3, val4}
-	privVals := []*types.PrivValidator{privVal1, privVal2, privVal3, privVal4}
+	vals := []*types.Validator{val1, val2}
+	privVals := []*types.PrivValidator{privVal1, privVal2}
 
 	valSet := types.NewValidatorSet(vals...)
 	state := ChainState{
@@ -64,7 +62,7 @@ func main() {
 		defer closeCh()
 		m := NewMachine(config, state, blockExec, ch, pubCh)
 		m.SetPrivValidator(privVals[i])
-		if i == 1 {
+		if i == 0 {
 			m.SetLogger(log.Output(zerolog.ConsoleWriter{Out: os.Stderr}))
 		}
 		m.Start()
